@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Карта организаций</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: Arial, sans-serif; font-size: 12px; }
+    #map { height: 100vh; width: 100%; }
+    .table-container {
+      background: rgba(255, 255, 255, 0.425);
+      backdrop-filter: blur(4px);
+      border: 1px solid #ccc; border-radius: 8px;
+      padding: 10px; overflow: auto;
+      resize: vertical; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+      z-index: 1000; width: 600px; height: 400px;
+    }
+    .table-container.collapsed { height: 20px; }
+    .table-container input, .table-container button {
+       margin-bottom: 8px; padding: 5px;
+      border-radius: 4px; border: 1px solid #ccc;
+    }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 6px 8px; border: 1px solid #ddd; text-align: left; }
+    th { background-color: #f0f0f0; position: sticky; top: 0; }
+    tr:hover { background-color: rgba(200, 200, 255, 0.3); cursor: pointer; }
+    
+    .subcell { display: none; padding: 0; max-height: 150px; overflow-y: auto; }
+    .subitem { padding: 6px; border-bottom: 1px solid #eee; }
+    .subitem:hover { background-color: rgba(200, 200, 255, 0.2); }
+    .side-panel {
+      position: absolute; right: 10px; top: 10px; z-index: 1000;
+      display: flex; flex-direction: column; max-width: 600px;
+    }
+    #region-info {
+      margin-top: 10px; background: rgba(255,255,255,0.9);
+      padding: 10px; border-radius: 8px; font-size: 13px;
+    }
+    .pie-container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      overflow: hidden;
+    }
+    .pie-text {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      font-weight: bold;
+      text-shadow: 0 0 3px rgba(0,0,0,0.7);
+      text-align: center;
+      z-index: 2;
+    }
+    .region-label {
+      font-size: 0.7em;
+      margin-top: 3px;
+    }
+    .leaflet-marker-icon {
+      z-index: 1000 !important;
+    }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+<div class="side-panel">
+  <div class="table-container collapsed">
+    <input type="text" id="search-input" placeholder="Поиск...">
+    <button id="reset-view">Сброс</button>
+    <button id="toggle-table">Развернуть</button>
+    <button id="toggle-view-mode">Только диаграммы/организации</button>
+    <table>
+      <thead>
+        <tr>
+          <th>Сопровождающий</th>
+          <th>Организации</th>
+          <th>Подключено</th>
+        </tr>
+      </thead>
+      <tbody id="table-body"></tbody>
+    </table>
+  </div>
+  <div id="region-info">Выберите регион</div>
+</div>
+
+<script>
+  // Конфигурация
+  const CONFIG = {
+    maxMarkers: 20000,
+    markerBatchSize: 200,
+    colorsCount: 50,
+    minZoomForMarkers: 8
+  };
+
+  // Состояние приложения
+  const state = {
+    viewMode: 'charts', //  'charts', 'markers'
+    currentFilter: null,
+    allCities: [],
+    filteredCities: [],
+    zoomLevel: 5.4
+  };
+
+  // Инициализация карты
+  const map = L.map('map', {
+    center: [47.5, 68.5],
+    zoom: state.zoomLevel,
+    minZoom: 5,
+    maxZoom: 19,
+    maxBounds: [[30.0, 42.0], [59.0, 95.0]]
+  });
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  
+  // Слои
+  const markersLayer = L.layerGroup().addTo(map);
+  const pieChartsLayer = L.layerGroup().addTo(map);
+  const regionPolygons = {};
+
+  // Данные регионов
+  const regionNames = {
+    "Abai": "АБАЙСКАЯ ОБЛ.", "Akmola": "АКМОЛИНСКАЯ ОБЛ.",
+    "Aktobe": "АКТЮБИНСКАЯ ОБЛ.", "Almaty": "АЛМАТИНСКАЯ ОБЛ.",
+    "Almaty (city)": "Г. АЛМАТЫ", "Atyrau": "АТЫРАУСКАЯ ОБЛ.",
+    "East Kazakhstan": "ВКО", "Jambyl": "ЖАМБЫЛСКАЯ ОБЛ.",
+    "Jetisu": "ЖЕТЫСУСКАЯ ОБЛ.", "West Kazakhstan": "ЗКО",
+    "Karaganda": "КАРАГАНДИНСКАЯ ОБЛ.", "Kostanay": "КОСТАНАЙСКАЯ ОБЛ.",
+    "Kyzylorda": "КЫЗЫЛОРДИНСКАЯ ОБЛ.", "Mangystau": "МАНГИСТАУСКАЯ ОБЛ.",
+    "Pavlodar": "ПАВЛОДАРСКАЯ ОБЛ.", "North Kazakhstan": "СКО",
+    "Turkistan": "ТУРКЕСТАНСКАЯ ОБЛ.", "Ulytau": "УЛЫТАУСКАЯ ОБЛ.",
+    "Astana": "Г. АСТАНА", "Shymkent (city)": "Г. ШЫМКЕНТ"
+  };
+
+  // Цвета
+  // Палитра и цвета
+  const palette = Array.from({ length: 100 }, (_, i) =>
+    `hsl(${Math.floor(360 / 100 * i)}, 65%, 55%)`
+  ).sort(() => Math.random() - 0.5);
+
+  const colors = {};
+  let nextColorIndex = 0;
+
+  function getColor(attendant) {
+    if (!colors[attendant]) {
+      colors[attendant] = palette[nextColorIndex % palette.length];
+      nextColorIndex++;
+    }
+    return colors[attendant];
+}
+
+  // Основные функции
+  const markerCache = new Map(); // cityId (например, BIN) → marker
+
+  function showMarkers(cities, forceShow = false, forcedColor = null) {
+    const currentZoom = map.getZoom();
+    if (!forceShow && currentZoom < CONFIG.minZoomForMarkers) {
+      markersLayer.clearLayers();
+      return;
+    }
+    pieChartsLayer.clearLayers();
+    // Удаляем все маркеры из слоя (но не из кэша)
+    markersLayer.clearLayers();
+
+    for (const city of cities) {
+      const cityId = city.bin || city.org_name || `${city.lat}_${city.lon}`;
+
+      let marker = markerCache.get(cityId);
+
+      if (!marker) {
+        const color = forcedColor || getColor(city.attendant);
+
+        marker = L.circleMarker([city.lat, city.lon], {
+          radius: 5,
+          fillColor: color,
+          color: "#fff",
+          weight: 1,
+          fillOpacity: 0.9
+        }).bindTooltip(`
+        <b>${city.org_name}</b><br>
+        ${city.attendant}<br>
+        ${city.address}<br>
+        Подключено к ЕХД БО: <b>${city.connected_to_exdbo === 1 ? 'да' : 'нет'}</b>
+      `, {
+          direction: 'top',
+          sticky: true
+        });
+
+        marker.on("click", () => map.flyTo([city.lat, city.lon], 14));
+
+        markerCache.set(cityId, marker);
+      }
+
+      markersLayer.addLayer(marker);
+    }
+  }
+
+
+  function createPieChart(regionName, total, connected, center) {
+    const size = Math.min(60, Math.max(30, Math.sqrt(total) * 3));
+    const angle = (connected / total) * 360;
+    const x = size/2 + size/2 * Math.sin(angle * Math.PI/180);
+    const y = size/2 - size/2 * Math.cos(angle * Math.PI/180);
+    const path = `M ${size/2} ${size/2} L ${size/2} 0 A ${size/2} ${size/2} 0 ${angle > 180 ? 1 : 0} 1 ${x} ${y} Z`;
+    
+    const name = regionName.startsWith("Г. ") ? regionName : regionName.split(' ')[0];
+
+    return L.marker(center, {
+      icon: L.divIcon({
+        className: '',
+        html: `
+          <div class="pie-container" style="width:${size}px;height:${size}px">
+            <svg width="${size}" height="${size}">
+              <circle cx="${size/2}" cy="${size/2}" r="${size/2}" fill="#f44336"/>
+              <path d="${path}" fill="#4CAF50"/>
+            </svg>
+            <div class="pie-text">${total}<div class="region-label">${name}</div></div>
+          </div>
+        `,
+        iconSize: [size, size]
+      }),
+      zIndexOffset: 1000
+    });
+  }
+
+  function updatePieCharts(cities) {
+    pieChartsLayer.clearLayers();
+    const regions = {};
+
+    cities.forEach(city => {
+      const region = city.region_kato || 'Не указан';
+      regions[region] = regions[region] || [];
+      regions[region].push(city);
+    });
+
+    Object.entries(regions).forEach(([name, cities]) => {
+      const total = cities.length;
+      const connected = cities.filter(c => c.connected_to_exdbo === 1).length;
+
+      let center = null;
+
+      // 🛠 Ручная установка координат для конкретной области
+      if (name === "АКМОЛИНСКАЯ ОБЛ.") {
+        center = { lat: 51.6, lng: 70.8 };
+      } else if (name === "КАРАГНДИНСКАЯ ОБЛ.") {
+        center = { lat: 51.6, lng: 70.8 };}
+        else if (name === "АЛМАТИНСКАЯ ОБЛ.") {
+        center = { lat: 51.6, lng: 70.8 }; }
+      else if (regionPolygons[name]) {
+        center = regionPolygons[name].getBounds().getCenter();
+      } else if (cities[0]) {
+        center = { lat: cities[0].lat, lng: cities[0].lon };
+      }
+
+      if (center) {
+        pieChartsLayer.addLayer(
+          createPieChart(name, total, connected, [center.lat, center.lng])
+        );
+      }
+    });
+  }
+
+
+  function updateDisplay() {
+    pieChartsLayer.clearLayers();
+    markersLayer.clearLayers();
+
+    if (state.viewMode === 'charts') {
+      updatePieCharts(state.filteredCities);
+    }
+
+    const forceShowMarkers = state.viewMode === 'markers' ;
+    showMarkers(state.filteredCities, forceShowMarkers);
+  }
+
+
+document.getElementById("toggle-view-mode").addEventListener("click", function () {
+  if (state.viewMode === 'charts') {
+    state.viewMode = 'markers';
+    this.textContent = 'Только диаграммы/организации';
+  } else {
+    state.viewMode = 'charts';
+    this.textContent = 'Только диаграммы/организации';
+  }
+  updateDisplay();
+});
+
+
+
+  // Инициализация данных
+  function init() {
+    fetch("https://raw.githubusercontent.com/abzal4/KZ_GEOJSON/main/kz.json")
+      .then(r => r.json())
+      .then(geoData => {
+        L.geoJSON(geoData, {
+          style: {color: "#555", weight: 1, fillOpacity: 0.07},
+          onEachFeature: (feature, layer) => {
+            const name = regionNames[feature.properties.name] || feature.properties.name;
+            regionPolygons[name] = layer;
+            
+            layer.bindTooltip(name, {direction: "center"})
+              .on({
+                mouseover: () => layer.setStyle({weight: 3, color: "#0066cc", fillOpacity: 0.2}),
+                mouseout: () => layer.setStyle({weight: 1, color: "#555", fillOpacity: 0.07}),
+                click: () => {
+                  state.currentFilter = name;
+                  filterCities();
+                  updateRegionInfo(name);
+                }
+              }).addTo(map);
+          }
+        });
+      });
+
+    fetch("http://localhost:3000/cities")
+      .then(r => r.json())
+      .then(data => {
+        state.allCities = data;
+        state.filteredCities = data;
+        state.groups = data.reduce((acc, city) => {
+          const key = city.attendant || "Не указано";
+          acc[key] = acc[key] || [];
+          acc[key].push(city);
+          return acc;
+        }, {});
+        initTable(data);
+        updateDisplay();
+      });
+
+    // Обработчики событий
+    map.on('zoomend', () => {
+      state.zoomLevel = map.getZoom();
+      updateDisplay();
+    });
+
+
+    document.getElementById("search-input").addEventListener("input", function () {
+      const groups = state.groups;
+      const query = this.value.trim().toLowerCase();
+      const tableContainer = document.querySelector(".table-container");
+      const toggleButton = document.getElementById("toggle-table");
+      const rows = document.querySelectorAll("#table-body > tr");
+      const filteredCities = [];
+
+      tableContainer.classList.remove("collapsed");
+      toggleButton.textContent = "Свернуть";
+
+      for (let i = 0; i < rows.length; i += 2) {
+        const mainRow = rows[i];
+        const subRow = rows[i + 1];
+        const subCell = subRow.querySelector(".subcell");
+        const attendant = mainRow.children[0].textContent.toLowerCase();
+        const subitems = subCell.querySelectorAll(".subitem");
+
+        let matchFound = false;
+        const matchedCities = [];
+
+        subitems.forEach((item, index) => {
+          const text = item.innerText.toLowerCase();
+          const isMatch = attendant.includes(query) || text.includes(query);
+          item.style.display = isMatch ? "" : "none";
+          if (isMatch) {
+            matchFound = true;
+            matchedCities.push(groups[mainRow.children[0].textContent][index]);
+          }
+        });
+
+        mainRow.style.display = matchFound ? "" : "none";
+        subRow.style.display = matchFound ? "" : "none";
+        subRow.style.display = matchFound ? "table-row" : "none"; // 👈 тут важно
+        if (matchFound) subCell.style.display = "table-cell";
+
+        if (matchFound) filteredCities.push(...matchedCities);
+      }
+
+      state.searchQuery = query;
+      state.filteredCities = query === "" ? state.allCities : filteredCities;
+      updateDisplay();
+    });
+
+
+    document.getElementById("reset-view").addEventListener("click", () => {
+      state.currentFilter = null;
+      state.searchQuery = '';
+      document.getElementById("search-input").value = "";
+      const rows = document.querySelectorAll("#table-body > tr");
+      rows.forEach((row, i) => {
+        row.style.display = i % 2 === 0 ? "" : "none"; // главные строки видимы, подстроки скрыты
+      });
+      filterCities();
+      document.getElementById("region-info").textContent = "Выберите регион";
+    });
+
+    document.getElementById("toggle-table").addEventListener("click", function() {
+      const container = document.querySelector(".table-container");
+      container.classList.toggle("collapsed");
+      this.textContent = container.classList.contains("collapsed") ? "Развернуть" : "Свернуть";
+    });
+  }
+
+  function filterCities() {
+    let result = state.allCities;
+    
+    if (state.currentFilter) {
+      result = result.filter(c => 
+        (c.region_kato || "").toUpperCase() === state.currentFilter.toUpperCase()
+      );
+    }
+    
+    if (state.searchQuery) {
+      const q = state.searchQuery;
+      result = result.filter(c => 
+        (c.attendant || "").toLowerCase().includes(q) ||
+        (c.org_name || "").toLowerCase().includes(q) ||
+        (c.address || "").toLowerCase().includes(q) ||
+        (c.bin || "").includes(q)
+      );
+    }
+    
+    state.filteredCities = result;
+    updateDisplay();
+  }
+
+  function updateRegionInfo(region) {
+    const total = state.filteredCities.length;
+    const connected = state.filteredCities.filter(c => c.connected_to_exdbo === 1).length;
+    document.getElementById("region-info").innerHTML = `
+      <b>${region}</b><br>Организации: <b>${total}</b><br>Подключено: <b>${connected}</b>
+    `;
+  }
+
+  function initTable(data) {
+    const tableBody = document.getElementById("table-body");
+    const groups = data.reduce((acc, city) => {
+      const key = city.attendant || "Не указано";
+      acc[key] = acc[key] || [];
+      acc[key].push(city);
+      return acc;
+    }, {});
+
+    Object.entries(groups)
+      .sort((a, b) => b[1].length - a[1].length)
+      .forEach(([att, cities]) => {
+        const row = document.createElement("tr");
+        const connected = cities.filter(c => c.connected_to_exdbo === 1).length;
+        
+        row.innerHTML = `
+          <td style="color:${getColor(att)};font-weight:bold">${att}</td>
+          <td>${cities.length}</td>
+          <td style="font-weight:bold">${connected}</td>
+        `;
+        
+        const subRow = document.createElement("tr");
+        const subCell = document.createElement("td");
+        subCell.colSpan = 3;
+        subCell.className = "subcell";
+        subCell.append(...cities.map(city => createSubitem(city, getColor(att))));
+        subRow.append(subCell);
+        
+        let isExpanded = false;
+
+        row.addEventListener("click", () => {
+          document.querySelectorAll(".subcell").forEach(c => c.style.display = "none");
+
+          if (!isExpanded) {
+            subCell.style.display = "table-cell";
+            state.currentFilter = null;
+            state.filteredCities = cities;
+            updateDisplay();
+            isExpanded = true;
+          } else {
+            subCell.style.display = "none";
+            state.filteredCities = state.allCities;
+            updateDisplay();
+            isExpanded = false;
+          }
+        });
+        
+        tableBody.append(row, subRow);
+      });
+  }
+
+  function createSubitem(city, color) {
+    const div = document.createElement("div");
+    div.className = "subitem";
+    div.style.color = color;
+    div.innerHTML = `
+      • <b>${city.org_name}</b><br>
+      <small style="color:#444">${city.address}</small><br>
+      <small style="color:#666">БИН: ${city.bin || "не указан"}</small><br>
+      <small>Подключено: ${city.connected_to_exdbo === 1 ? "да" : "нет"}</small>`;
+    div.addEventListener("click", () => map.flyTo([city.lat, city.lon], 14));
+    return div;
+  }
+
+  init();
+</script>
+</body>
+</html>
